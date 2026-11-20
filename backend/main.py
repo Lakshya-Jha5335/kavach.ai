@@ -5,7 +5,7 @@ import os
 import socket
 from urllib.parse import urlparse
 
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -14,8 +14,18 @@ from header_scanner import scan_headers
 from tls_checker import check_tls
 from url_analyser import analyze_url
 
-# New SQLite persistence and threat detection modules
-from database import get_recent_scans_db, init_db, report_threat_db, save_scan
+# Supabase JWT authentication helpers
+from auth import get_current_user, get_optional_user
+
+# SQLite persistence and threat detection modules
+from database import (
+    get_recent_scans_db,
+    get_user_scans_db,
+    init_db,
+    report_threat_db,
+    save_scan,
+    save_user_scan,
+)
 from redirect_tracer import trace_redirects
 from ct_monitor import check_ct_logs
 from vuln_scanner import scan_web_security
@@ -44,7 +54,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,
     # "*" origins combined with credentials=True is invalid per the CORS spec
-    # and browsers reject it. This API uses no cookies, so credentials are off.
+    # and browsers reject it. This API uses Bearer tokens, so cookies are off.
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -67,8 +77,6 @@ def normalize_url(raw: str) -> str:
     if not url:
         raise HTTPException(status_code=400, detail="URL is required")
 
-    # Case-insensitive scheme handling. The old startswith() check turned
-    # "HTTP://x.com" into "https://HTTP://x.com" and "ftp://x" into "https://ftp://x".
     if "://" not in url:
         url = "https://" + url
 
@@ -85,8 +93,8 @@ def normalize_url(raw: str) -> str:
 
 
 def _resolves_to_public_ip_only(hostname: str) -> bool | None:
-    """True if every resolved IP is public, False if any is private/internal, None if the name doesn't resolve.
-    Blocking call: run it in a thread."""
+    """True if every resolved IP is public, False if any is private/internal,
+    None if the name doesn't resolve. Blocking call: run it in a thread."""
     try:
         infos = socket.getaddrinfo(hostname, None)
     except (socket.gaierror, UnicodeError):
@@ -104,8 +112,8 @@ def _resolves_to_public_ip_only(hostname: str) -> bool | None:
 
 
 async def ensure_public_host(hostname: str) -> None:
-    """SSRF guard: this endpoint makes server-side requests to user-supplied URLs,
-    so refuse localhost, private ranges and cloud metadata addresses."""
+    """SSRF guard: this endpoint makes server-side requests to user-supplied
+    URLs, so refuse localhost, private ranges and cloud metadata addresses."""
     result = await asyncio.to_thread(_resolves_to_public_ip_only, hostname)
     if result is None:
         raise HTTPException(status_code=400, detail="Domain could not be resolved")
@@ -136,8 +144,12 @@ async def _run_maybe_async(func, *args):
 
 
 @app.post("/api/scan")
-async def scan_website(request: ScanRequest):
+async def scan_website(
+    request: ScanRequest,
+    user: dict | None = Depends(get_optional_user),
+):
     target_url = normalize_url(request.url)
+
     try:
         url_res = await _run_maybe_async(analyze_url, target_url)
     except HTTPException:
@@ -214,17 +226,35 @@ async def scan_website(request: ScanRequest):
         for flag in (r.get("flags") or [])
     ]
 
-    # Persist scan history in local SQLite; DB errors never fail a scan response.
+    # Persist global scan history in local SQLite; DB errors never fail a scan response.
     try:
         await asyncio.to_thread(save_scan, target_url, trust_score, verdict, all_flags)
     except Exception as e:
         logger.warning("SQLite insert warning: %s", e)
+
+    # Also save to personal user_scans history when the caller is logged in via Supabase.
+    saved_to_account = False
+    if user:
+        try:
+            await asyncio.to_thread(
+                save_user_scan,
+                user["user_id"],
+                user["email"],
+                target_url,
+                trust_score,
+                verdict,
+                all_flags,
+            )
+            saved_to_account = True
+        except Exception as e:
+            logger.warning("SQLite user_scans insert warning: %s", e)
 
     return {
         "url": target_url,
         "trust_score": trust_score,
         "verdict": verdict,
         "flags": all_flags,
+        "saved_to_account": saved_to_account,
         "details": {
             "url_analysis": url_res,
             "tls_certificate": tls_res,
@@ -262,3 +292,18 @@ def get_recent_scans():
     except Exception as e:
         logger.warning("SQLite fetch warning: %s", e)
         return []
+
+
+@app.get("/api/me")
+def get_authenticated_user(user: dict = Depends(get_current_user)):
+    return {"authenticated": True, "user": user}
+
+
+@app.get("/api/my-scans")
+def get_my_scans(limit: int = 50, user: dict = Depends(get_current_user)):
+    try:
+        scans = get_user_scans_db(user["user_id"], limit)
+        return {"user_id": user["user_id"], "count": len(scans), "scans": scans}
+    except Exception as e:
+        logger.warning("SQLite user_scans fetch warning: %s", e)
+        return {"user_id": user["user_id"], "count": 0, "scans": []}

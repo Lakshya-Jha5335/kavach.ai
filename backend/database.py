@@ -50,8 +50,8 @@ def _now() -> str:
 def _with_scheme(raw: str) -> str:
     """Make sure the text starts with a real scheme so urlsplit finds the host.
 
-    - Backslashes become slashes, because browsers treat "\\" like "/" but
-      Python doesn't ("https://evil.com\\@paypal.com" goes to evil.com).
+    - Backslashes become slashes, because browsers treat "\\" like "/"
+      but Python doesn't ("https://evil.com\\@paypal.com" goes to evil.com).
     - Only a real "scheme://" at the START counts. The old `"://" in raw`
       check also matched "://" inside a query string.
     """
@@ -65,8 +65,8 @@ def _normalize_ip(host: str):
     """Return the canonical form of an IP address, or None if host isn't one.
 
     Handles the obfuscated IPv4 spellings browsers accept (decimal
-    "2130706433", hex "0x7f.0.0.1", octal "0177.0.0.1", short "127.1"), so
-    every spelling of one IP maps to ONE stored value.
+    "2130706433", hex "0x7f.0.0.1", octal "0177.0.0.1", short "127.1"),
+    so every spelling of one IP maps to ONE stored value.
     """
     if ":" in host:  # IPv6
         try:
@@ -94,6 +94,7 @@ def _normalize_ip(host: str):
     *head, last = nums
     if any(n > 255 for n in head) or last >= 256 ** (5 - len(nums)):
         return None
+
     value = last + sum(n << (8 * (3 - i)) for i, n in enumerate(head))
     return str(ipaddress.IPv4Address(value))
 
@@ -103,7 +104,6 @@ def normalize_domain(url_or_domain: str) -> str:
 
     Uses `.hostname` (not `.netloc`) so ports, usernames and passwords are
     handled correctly: "https://paypal.com:x@evil.com" is evil.com.
-
     Raises ValueError if no valid host can be found.
     """
     raw = (url_or_domain or "").strip()
@@ -133,6 +133,7 @@ def normalize_domain(url_or_domain: str) -> str:
     host = host.lower()
     if len(host) > 253 or "." not in host or not _HOST_RE.fullmatch(host):
         raise ValueError(f"Invalid domain: {host!r}")
+
     return host
 
 
@@ -176,11 +177,27 @@ def init_db():
                 created_at TEXT NOT NULL
             )
         """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS user_scans (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id TEXT NOT NULL,
+                user_email TEXT,
+                url TEXT NOT NULL,
+                trust_score INTEGER NOT NULL,
+                verdict TEXT NOT NULL,
+                flags TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+        """)
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_user_scans_uid ON user_scans(user_id, id DESC)"
+        )
 
 
 def _json_default(obj):
-    """Let json.dumps handle sets and other odd flag types instead of crashing
-    (a set becomes a sorted list; anything else becomes its string form)."""
+    """Let json.dumps handle sets and other odd flag types instead of
+    crashing (a set becomes a sorted list; anything else becomes its
+    string form)."""
     if isinstance(obj, (set, frozenset)):
         return sorted(obj, key=str)
     return str(obj)
@@ -191,6 +208,7 @@ def save_scan(url: str, trust_score: int, verdict: str, flags: list):
     if not url:
         raise ValueError("A URL is required")
     trust_score = max(0, min(100, int(trust_score)))  # keep it in 0-100
+
     with get_conn() as conn:
         conn.execute(
             "INSERT INTO scans (url, trust_score, verdict, flags, created_at) VALUES (?, ?, ?, ?, ?)",
@@ -219,10 +237,12 @@ def get_recent_scans_db(limit: int = 10) -> list:
         limit = 10
     # A negative LIMIT in SQLite means "no limit", so clamp it
     limit = max(1, min(limit, 100))
+
     with get_conn() as conn:
         rows = conn.execute(
             "SELECT * FROM scans ORDER BY id DESC LIMIT ?", (limit,)
         ).fetchall()
+
     return [
         {
             "id": r["id"],
@@ -277,3 +297,62 @@ def get_community_reports_db(domain: str) -> list:
             (domain,),
         ).fetchall()
     return [dict(r) for r in rows]
+
+
+def save_user_scan(
+    user_id: str,
+    user_email: str,
+    url: str,
+    trust_score: int,
+    verdict: str,
+    flags: list,
+):
+    """Save a scan tied to an authenticated Supabase user."""
+    url = clean_url(url)
+    if not url:
+        raise ValueError("A URL is required")
+    trust_score = max(0, min(100, int(trust_score)))
+
+    with get_conn() as conn:
+        conn.execute(
+            """
+            INSERT INTO user_scans (user_id, user_email, url, trust_score, verdict, flags, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                str(user_id),
+                str(user_email or ""),
+                url,
+                trust_score,
+                str(verdict)[:MAX_VERDICT_LEN],
+                json.dumps(flags or [], default=_json_default),
+                _now(),
+            ),
+        )
+
+
+def get_user_scans_db(user_id: str, limit: int = 50) -> list:
+    """Return recent scans for a specific Supabase user_id."""
+    try:
+        limit = int(limit)
+    except (TypeError, ValueError):
+        limit = 50
+    limit = max(1, min(limit, 100))
+
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM user_scans WHERE user_id = ? ORDER BY id DESC LIMIT ?",
+            (str(user_id), limit),
+        ).fetchall()
+
+    return [
+        {
+            "id": r["id"],
+            "url": r["url"],
+            "trust_score": r["trust_score"],
+            "verdict": r["verdict"],
+            "flags": _load_flags(r["flags"]),
+            "created_at": r["created_at"],
+        }
+        for r in rows
+    ]
